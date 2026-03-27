@@ -1,6 +1,7 @@
 /*
  * create_aggregate_device.c
  * Creates a macOS aggregate audio device combining all BlackHole_* devices.
+ * Automatically matches the system sample rate.
  *
  * Compile: clang -o create_aggregate_device create_aggregate_device.c \
  *          -framework CoreAudio -framework CoreFoundation
@@ -33,6 +34,39 @@ static Boolean is_blackhole_device(AudioObjectID deviceID) {
     Boolean result = CFStringHasPrefix(name, CFSTR("BlackHole_"));
     CFRelease(name);
     return result;
+}
+
+// Get current system sample rate
+static Float64 get_system_sample_rate(void) {
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectID defaultOut = kAudioObjectUnknown;
+    UInt32 size = sizeof(defaultOut);
+    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &defaultOut);
+    if (status != noErr || defaultOut == kAudioObjectUnknown) return 48000.0;
+
+    AudioObjectPropertyAddress rateAddr = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    Float64 rate = 48000.0;
+    size = sizeof(rate);
+    AudioObjectGetPropertyData(defaultOut, &rateAddr, 0, NULL, &size, &rate);
+    return rate;
+}
+
+// Set sample rate on a device
+static OSStatus set_sample_rate(AudioObjectID deviceID, Float64 rate) {
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    return AudioObjectSetPropertyData(deviceID, &addr, 0, NULL, sizeof(rate), &rate);
 }
 
 // Remove existing aggregate device with a given UID if it exists
@@ -76,6 +110,10 @@ int main(int argc, const char* argv[]) {
     if (argc >= 2) aggregateName = argv[1];
     if (argc >= 3) aggregateUID  = argv[2];
 
+    // Get system sample rate first
+    Float64 systemRate = get_system_sample_rate();
+    printf("System sample rate: %.0f Hz\n", systemRate);
+
     // Remove any existing aggregate with the same UID
     remove_existing_aggregate(aggregateUID);
 
@@ -103,9 +141,7 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    // Build sub-device list as an array of dictionaries
-    // kAudioAggregateDeviceSubDeviceListKey expects:
-    //   [ { kAudioSubDeviceUIDKey: "<uid>" }, ... ]
+    // Build sub-device list as array of dicts: [{kAudioSubDeviceUIDKey: uid}, ...]
     CFMutableArrayRef subDeviceList = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     int found = 0;
 
@@ -120,7 +156,13 @@ int main(int argc, const char* argv[]) {
                 CFStringGetCString(uid,  uidBuf,  sizeof(uidBuf),  kCFStringEncodingUTF8);
                 printf("  Found: %s  (UID: %s)\n", nameBuf, uidBuf);
 
-                // Wrap UID in a dict: { kAudioSubDeviceUIDKey -> uid }
+                // Set each sub-device to the system sample rate now
+                OSStatus rateStatus = set_sample_rate(devices[i], systemRate);
+                if (rateStatus != noErr) {
+                    printf("  Warning: Could not set sample rate on %s (status=%d)\n", nameBuf, rateStatus);
+                }
+
+                // Wrap UID in dict for sub-device list
                 CFMutableDictionaryRef subDict = CFDictionaryCreateMutable(
                     NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
                 CFDictionarySetValue(subDict, CFSTR(kAudioSubDeviceUIDKey), uid);
@@ -140,9 +182,10 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    printf("\nCreating aggregate device \"%s\" with %d sub-device(s)...\n", aggregateName, found);
+    printf("\nCreating aggregate device \"%s\" with %d sub-device(s) at %.0f Hz...\n",
+           aggregateName, found, systemRate);
 
-    // Build the aggregate device description dictionary
+    // Build aggregate description dict
     CFMutableDictionaryRef aggDesc = CFDictionaryCreateMutable(
         NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 
@@ -172,6 +215,15 @@ int main(int argc, const char* argv[]) {
     if (status != noErr) {
         fprintf(stderr, "Error: Failed to create aggregate device (status=%d)\n", status);
         return 1;
+    }
+
+    // Set aggregate device sample rate to match system
+    OSStatus rateStatus = set_sample_rate(aggDeviceID, systemRate);
+    if (rateStatus != noErr) {
+        printf("Warning: Could not set aggregate sample rate (status=%d)\n", rateStatus);
+        printf("  → Please set it manually to %.0f Hz in Audio MIDI Setup.\n", systemRate);
+    } else {
+        printf("Sample rate set to %.0f Hz ✓\n", systemRate);
     }
 
     printf("✅ Aggregate device \"%s\" created successfully! (ID: %u)\n", aggregateName, aggDeviceID);
