@@ -1,231 +1,214 @@
 /*
  * create_aggregate_device.c
- * Creates a macOS aggregate audio device combining all BlackHole_* devices.
- * Automatically matches the system sample rate.
  *
- * Compile: clang -o create_aggregate_device create_aggregate_device.c \
- *          -framework CoreAudio -framework CoreFoundation
- * Usage:   ./create_aggregate_device [aggregate_name] [aggregate_uid]
+ * Creates a macOS aggregate audio device combining:
+ *   - The system default OUTPUT device (e.g. Zen Go) as clock master + output
+ *   - All BlackHole_* devices as input sub-devices
+ *
+ * This matches the standard "Audio MIDI Setup → Create Aggregate Device" workflow:
+ * one aggregate for BOTH input and output in Logic, with a hardware clock source.
+ *
+ * Compile:
+ *   clang -o create_aggregate_device create_aggregate_device.c \
+ *         -framework CoreAudio -framework CoreFoundation
+ * Usage:
+ *   ./create_aggregate_device [aggregate_name] [aggregate_uid]
  */
 
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
-// Get a string property for a given audio device
-static CFStringRef get_device_string_prop(AudioObjectID deviceID, AudioObjectPropertySelector sel) {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static CFStringRef get_string_prop(AudioObjectID obj, AudioObjectPropertySelector sel) {
     CFStringRef val = NULL;
     UInt32 size = sizeof(val);
-    AudioObjectPropertyAddress addr = {
-        sel,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    OSStatus status = AudioObjectGetPropertyData(deviceID, &addr, 0, NULL, &size, &val);
-    if (status != noErr) return NULL;
+    AudioObjectPropertyAddress addr = { sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectGetPropertyData(obj, &addr, 0, NULL, &size, &val);
+    return val;  // caller must CFRelease
+}
+
+static OSStatus set_float64_prop(AudioObjectID obj, AudioObjectPropertySelector sel, Float64 val) {
+    AudioObjectPropertyAddress addr = { sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    return AudioObjectSetPropertyData(obj, &addr, 0, NULL, sizeof(val), &val);
+}
+
+static Float64 get_float64_prop(AudioObjectID obj, AudioObjectPropertySelector sel) {
+    Float64 val = 0;
+    UInt32 size = sizeof(val);
+    AudioObjectPropertyAddress addr = { sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectGetPropertyData(obj, &addr, 0, NULL, &size, &val);
     return val;
 }
 
-// Check if a device name starts with "BlackHole_"
-static Boolean is_blackhole_device(AudioObjectID deviceID) {
-    CFStringRef name = get_device_string_prop(deviceID, kAudioObjectPropertyName);
-    if (name == NULL) return false;
-    Boolean result = CFStringHasPrefix(name, CFSTR("BlackHole_"));
-    CFRelease(name);
-    return result;
-}
-
-// Get current system sample rate
-static Float64 get_system_sample_rate(void) {
-    AudioObjectPropertyAddress addr = {
-        kAudioHardwarePropertyDefaultOutputDevice,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    AudioObjectID defaultOut = kAudioObjectUnknown;
-    UInt32 size = sizeof(defaultOut);
-    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &defaultOut);
-    if (status != noErr || defaultOut == kAudioObjectUnknown) return 48000.0;
-
-    AudioObjectPropertyAddress rateAddr = {
-        kAudioDevicePropertyNominalSampleRate,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    Float64 rate = 48000.0;
-    size = sizeof(rate);
-    AudioObjectGetPropertyData(defaultOut, &rateAddr, 0, NULL, &size, &rate);
-    return rate;
-}
-
-// Set sample rate on a device
-static OSStatus set_sample_rate(AudioObjectID deviceID, Float64 rate) {
-    AudioObjectPropertyAddress addr = {
-        kAudioDevicePropertyNominalSampleRate,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    return AudioObjectSetPropertyData(deviceID, &addr, 0, NULL, sizeof(rate), &rate);
-}
-
-// Remove existing aggregate device with a given UID if it exists
-static void remove_existing_aggregate(const char* uid) {
-    AudioObjectPropertyAddress addr = {
-        kAudioHardwarePropertyDevices,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
+static UInt32 get_channel_count(AudioObjectID deviceID, AudioObjectPropertyScope scope) {
+    AudioObjectPropertyAddress addr = { kAudioDevicePropertyStreamConfiguration, scope, kAudioObjectPropertyElementMain };
     UInt32 size = 0;
-    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size);
-    if (status != noErr || size == 0) return;
+    AudioObjectGetPropertyDataSize(deviceID, &addr, 0, NULL, &size);
+    AudioBufferList* list = malloc(size);
+    UInt32 count = 0;
+    if (AudioObjectGetPropertyData(deviceID, &addr, 0, NULL, &size, list) == noErr) {
+        for (UInt32 i = 0; i < list->mNumberBuffers; i++)
+            count += list->mBuffers[i].mNumberChannels;
+    }
+    free(list);
+    return count;
+}
 
-    UInt32 deviceCount = size / sizeof(AudioObjectID);
-    AudioObjectID* devices = malloc(size);
-    if (!devices) return;
-    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devices);
-    if (status != noErr) { free(devices); return; }
+// Remove existing aggregate with a given UID
+static void remove_existing_aggregate(const char* uid) {
+    AudioObjectPropertyAddress addr = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr) return;
+    UInt32 count = size / sizeof(AudioObjectID);
+    AudioObjectID* devs = malloc(size);
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devs);
 
-    CFStringRef targetUID = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
-
-    for (UInt32 i = 0; i < deviceCount; i++) {
-        CFStringRef deviceUID = get_device_string_prop(devices[i], kAudioDevicePropertyDeviceUID);
-        if (deviceUID && CFStringCompare(deviceUID, targetUID, 0) == kCFCompareEqualTo) {
-            printf("Removing existing aggregate device: %s\n", uid);
-            AudioHardwareDestroyAggregateDevice(devices[i]);
-            CFRelease(deviceUID);
+    CFStringRef target = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
+    for (UInt32 i = 0; i < count; i++) {
+        CFStringRef duid = get_string_prop(devs[i], kAudioDevicePropertyDeviceUID);
+        if (duid && CFStringCompare(duid, target, 0) == kCFCompareEqualTo) {
+            printf("Removing existing aggregate: %s\n", uid);
+            AudioHardwareDestroyAggregateDevice(devs[i]);
+            CFRelease(duid);
             break;
         }
-        if (deviceUID) CFRelease(deviceUID);
+        if (duid) CFRelease(duid);
     }
-
-    CFRelease(targetUID);
-    free(devices);
+    CFRelease(target);
+    free(devs);
 }
 
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 int main(int argc, const char* argv[]) {
     const char* aggregateName = "BlackHole_Aggregate";
     const char* aggregateUID  = "audio.existential.BlackHole_Aggregate_UID";
-
     if (argc >= 2) aggregateName = argv[1];
     if (argc >= 3) aggregateUID  = argv[2];
 
-    // Get system sample rate first
-    Float64 systemRate = get_system_sample_rate();
-    printf("System sample rate: %.0f Hz\n", systemRate);
-
-    // Remove any existing aggregate with the same UID
     remove_existing_aggregate(aggregateUID);
 
     // Get all audio devices
-    AudioObjectPropertyAddress devicesAddr = {
-        kAudioHardwarePropertyDevices,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-
+    AudioObjectPropertyAddress devicesAddr = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     UInt32 size = 0;
-    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size);
-    if (status != noErr || size == 0) {
-        fprintf(stderr, "Error: Cannot get audio device list (status=%d)\n", status);
-        return 1;
-    }
-
-    UInt32 deviceCount = size / sizeof(AudioObjectID);
+    AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size);
+    UInt32 totalCount = size / sizeof(AudioObjectID);
     AudioObjectID* devices = malloc(size);
-    if (!devices) { fprintf(stderr, "Error: malloc failed\n"); return 1; }
-    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size, devices);
-    if (status != noErr) {
-        fprintf(stderr, "Error: Cannot enumerate audio devices (status=%d)\n", status);
-        free(devices);
-        return 1;
-    }
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size, devices);
 
-    // Build sub-device list as array of dicts: [{kAudioSubDeviceUIDKey: uid}, ...]
-    CFMutableArrayRef subDeviceList = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-    int found = 0;
+    // Get the system default OUTPUT device (to use as clock master & output)
+    AudioObjectID defaultOut = kAudioObjectUnknown;
+    {
+        AudioObjectPropertyAddress a = { kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        UInt32 s = sizeof(defaultOut);
+        AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &s, &defaultOut);
+    }
+    Float64 systemRate = get_float64_prop(defaultOut, kAudioDevicePropertyNominalSampleRate);
+    if (systemRate == 0) systemRate = 48000.0;
+
+    CFStringRef defaultOutUID  = get_string_prop(defaultOut, kAudioDevicePropertyDeviceUID);
+    CFStringRef defaultOutName = get_string_prop(defaultOut, kAudioObjectPropertyName);
+    char outNameBuf[256] = "unknown";
+    if (defaultOutName) CFStringGetCString(defaultOutName, outNameBuf, sizeof(outNameBuf), kCFStringEncodingUTF8);
+
+    printf("System output device (clock master): %s @ %.0f Hz\n", outNameBuf, systemRate);
+
+    // Build sub-device list:
+    //   1) Output device (clock master, provides output channels)
+    //   2) All BlackHole_* devices (provide input channels)
+    CFMutableArrayRef subList = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    int bhCount = 0;
+
+    // Add output device first (it becomes the clock master)
+    if (defaultOutUID) {
+        CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(d, CFSTR(kAudioSubDeviceUIDKey), defaultOutUID);
+        CFArrayAppendValue(subList, d);
+        CFRelease(d);
+        CFRelease(defaultOutUID);
+    }
+    if (defaultOutName) CFRelease(defaultOutName);
 
     printf("Scanning for BlackHole_* devices...\n");
-    for (UInt32 i = 0; i < deviceCount; i++) {
-        if (is_blackhole_device(devices[i])) {
-            CFStringRef uid  = get_device_string_prop(devices[i], kAudioDevicePropertyDeviceUID);
-            CFStringRef name = get_device_string_prop(devices[i], kAudioObjectPropertyName);
-            if (uid && name) {
-                char nameBuf[256], uidBuf[256];
-                CFStringGetCString(name, nameBuf, sizeof(nameBuf), kCFStringEncodingUTF8);
-                CFStringGetCString(uid,  uidBuf,  sizeof(uidBuf),  kCFStringEncodingUTF8);
-                printf("  Found: %s  (UID: %s)\n", nameBuf, uidBuf);
-
-                // Set each sub-device to the system sample rate now
-                OSStatus rateStatus = set_sample_rate(devices[i], systemRate);
-                if (rateStatus != noErr) {
-                    printf("  Warning: Could not set sample rate on %s (status=%d)\n", nameBuf, rateStatus);
-                }
-
-                // Wrap UID in dict for sub-device list
-                CFMutableDictionaryRef subDict = CFDictionaryCreateMutable(
-                    NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-                CFDictionarySetValue(subDict, CFSTR(kAudioSubDeviceUIDKey), uid);
-                CFArrayAppendValue(subDeviceList, subDict);
-                CFRelease(subDict);
-                found++;
+    for (UInt32 i = 0; i < totalCount; i++) {
+        CFStringRef name = get_string_prop(devices[i], kAudioObjectPropertyName);
+        if (!name) continue;
+        Boolean isBH = CFStringHasPrefix(name, CFSTR("BlackHole_"));
+        if (isBH) {
+            CFStringRef uid = get_string_prop(devices[i], kAudioDevicePropertyDeviceUID);
+            char nb[256] = "", ub[256] = "";
+            CFStringGetCString(name, nb, sizeof(nb), kCFStringEncodingUTF8);
+            if (uid) CFStringGetCString(uid, ub, sizeof(ub), kCFStringEncodingUTF8);
+            UInt32 ins  = get_channel_count(devices[i], kAudioDevicePropertyScopeInput);
+            UInt32 outs = get_channel_count(devices[i], kAudioDevicePropertyScopeOutput);
+            printf("  + %s  (in:%u out:%u  UID: %s)\n", nb, ins, outs, ub);
+            if (uid) {
+                CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                CFDictionarySetValue(d, CFSTR(kAudioSubDeviceUIDKey), uid);
+                CFArrayAppendValue(subList, d);
+                CFRelease(d);
+                CFRelease(uid);
             }
-            if (uid)  CFRelease(uid);
-            if (name) CFRelease(name);
+            bhCount++;
         }
+        CFRelease(name);
     }
     free(devices);
 
-    if (found == 0) {
-        fprintf(stderr, "Error: No BlackHole_* devices found. Install them first.\n");
-        CFRelease(subDeviceList);
+    if (bhCount == 0) {
+        fprintf(stderr, "Error: No BlackHole_* devices found.\n");
+        CFRelease(subList);
         return 1;
     }
 
-    printf("\nCreating aggregate device \"%s\" with %d sub-device(s) at %.0f Hz...\n",
-           aggregateName, found, systemRate);
+    printf("\nCreating aggregate \"%s\" with %d sub-device(s) @ %.0f Hz...\n",
+           aggregateName, (int)CFArrayGetCount(subList), systemRate);
 
-    // Build aggregate description dict
-    CFMutableDictionaryRef aggDesc = CFDictionaryCreateMutable(
-        NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-
+    // Build aggregate description
+    CFMutableDictionaryRef desc = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFStringRef cfName = CFStringCreateWithCString(NULL, aggregateName, kCFStringEncodingUTF8);
     CFStringRef cfUID  = CFStringCreateWithCString(NULL, aggregateUID,  kCFStringEncodingUTF8);
-
-    CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceNameKey), cfName);
-    CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceUIDKey),  cfUID);
-    CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceSubDeviceListKey), subDeviceList);
-
-    // Public (visible in Audio MIDI Setup), not stacked
     int zero = 0;
     CFNumberRef cfZero = CFNumberCreate(NULL, kCFNumberIntType, &zero);
-    CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceIsPrivateKey), cfZero);
-    CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceIsStackedKey), cfZero);
 
-    // Create the aggregate device
-    AudioObjectID aggDeviceID = 0;
-    status = AudioHardwareCreateAggregateDevice(aggDesc, &aggDeviceID);
+    CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceNameKey), cfName);
+    CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceUIDKey),  cfUID);
+    CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceSubDeviceListKey), subList);
+    CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsPrivateKey), cfZero);  // visible
+    CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsStackedKey), cfZero);  // parallel (not stacked)
 
-    CFRelease(cfName);
-    CFRelease(cfUID);
-    CFRelease(cfZero);
-    CFRelease(subDeviceList);
-    CFRelease(aggDesc);
+    AudioObjectID aggID = 0;
+    OSStatus status = AudioHardwareCreateAggregateDevice(desc, &aggID);
+
+    CFRelease(cfName); CFRelease(cfUID); CFRelease(cfZero);
+    CFRelease(subList); CFRelease(desc);
 
     if (status != noErr) {
-        fprintf(stderr, "Error: Failed to create aggregate device (status=%d)\n", status);
+        fprintf(stderr, "Error: Cannot create aggregate device (status=%d)\n", status);
         return 1;
     }
 
-    // Set aggregate device sample rate to match system
-    OSStatus rateStatus = set_sample_rate(aggDeviceID, systemRate);
-    if (rateStatus != noErr) {
-        printf("Warning: Could not set aggregate sample rate (status=%d)\n", rateStatus);
-        printf("  → Please set it manually to %.0f Hz in Audio MIDI Setup.\n", systemRate);
-    } else {
-        printf("Sample rate set to %.0f Hz ✓\n", systemRate);
-    }
+    // Set sample rate on aggregate to match system
+    OSStatus rateStatus = set_float64_prop(aggID, kAudioDevicePropertyNominalSampleRate, systemRate);
+    if (rateStatus != noErr)
+        printf("Warning: could not set aggregate sample rate (status=%d)\n", rateStatus);
+    else
+        printf("Sample rate: %.0f Hz ✓\n", systemRate);
 
-    printf("✅ Aggregate device \"%s\" created successfully! (ID: %u)\n", aggregateName, aggDeviceID);
+    // Print resulting channel layout
+    UInt32 aggIns  = get_channel_count(aggID, kAudioDevicePropertyScopeInput);
+    UInt32 aggOuts = get_channel_count(aggID, kAudioDevicePropertyScopeOutput);
+    printf("✅ \"%s\" created (ID:%u)  — %u ins / %u outs\n", aggregateName, aggID, aggIns, aggOuts);
+    printf("\nIn Logic Pro:\n");
+    printf("  → Set BOTH Input AND Output device to \"%s\"\n", aggregateName);
+    printf("  → Output goes to %s (channels 1-%u)\n", outNameBuf, aggOuts > 16 ? 16 : aggOuts);
+    printf("  → BlackHole inputs start at channel %u\n", aggOuts + 1);
     return 0;
 }
