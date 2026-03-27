@@ -4541,15 +4541,30 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         secondPartFrameSize = inIOBufferFrameSize - firstPartFrameSize;
     }
     
-    // Keep track of last outputSampleTime and the cleared buffer status.
-    static Float64 lastOutputSampleTime = 0;
+    // Keep track of last write time (host time) and the cleared buffer status.
+    // Using host time (mach_absolute_time) instead of sample time to avoid
+    // clock-domain mismatches when input and output are on different IO contexts
+    // (e.g. output via standalone device, input via aggregate device).
+    static uint64_t lastWriteHostTime = 0;
     static Boolean isBufferClear = true;
+    
+    // Threshold: consider output stale after ~1 second of no writes.
+    // mach_absolute_time() units depend on hardware; use mach_timebase_info to convert.
+    // As a practical shortcut, we compare raw ticks: on Apple Silicon ~1GHz timebase,
+    // 1 second ≈ 1,000,000,000 ticks. On Intel it varies but is similar order.
+    // Using 2,000,000,000 ticks (~1-2 seconds) as a conservative stale threshold.
+    static const uint64_t kStaleThresholdTicks = 2000000000ULL;
     
     // From BlackHole to Application
     if(inOperationID == kAudioServerPlugInIOOperationReadInput)
     {
-        // If mute is one let's just fill the buffer with zeros or if there's no apps outputting audio
-        if (gMute_Master_Value || lastOutputSampleTime - inIOBufferFrameSize < inIOCycleInfo->mInputTime.mSampleTime)
+        // Suppress output if muted or if no app has written to the output recently.
+        // Use host-time comparison (clock-domain agnostic) instead of sample-time comparison
+        // so this works correctly when input and output run on different clock domains
+        // (e.g., output via standalone device and input via aggregate device).
+        uint64_t now = mach_absolute_time();
+        Boolean isStale = (lastWriteHostTime == 0) || (now - lastWriteHostTime > kStaleThresholdTicks);
+        if (gMute_Master_Value || isStale)
         {
             // Clear the ioMainBuffer
             vDSP_vclr(ioMainBuffer, 1, inIOBufferFrameSize * kNumber_Of_Channels);
@@ -4592,8 +4607,9 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         memcpy(gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, ioMainBuffer, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
         memcpy(gRingBuffer, (Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
         
-        // Save the last output time.
-        lastOutputSampleTime = inIOCycleInfo->mOutputTime.mSampleTime + inIOBufferFrameSize;
+        // Record the host time of the last write so ReadInput can check staleness
+        // in a clock-domain-agnostic way.
+        lastWriteHostTime = mach_absolute_time();
         isBufferClear = false;
     }
 

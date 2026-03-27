@@ -119,7 +119,7 @@ rm -rf build
 # Restart coreaudiod to pick up new drivers
 echo "Restarting coreaudiod..."
 sudo killall coreaudiod || true
-sleep 3
+sleep 6
 
 # Create aggregate device combining all BlackHole cables
 echo ""
