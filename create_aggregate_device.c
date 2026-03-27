@@ -12,37 +12,23 @@
 #include <stdio.h>
 #include <string.h>
 
-// Get the UID string for a given audio device
-static CFStringRef get_device_uid(AudioObjectID deviceID) {
-    CFStringRef uid = NULL;
-    UInt32 size = sizeof(uid);
+// Get a string property for a given audio device
+static CFStringRef get_device_string_prop(AudioObjectID deviceID, AudioObjectPropertySelector sel) {
+    CFStringRef val = NULL;
+    UInt32 size = sizeof(val);
     AudioObjectPropertyAddress addr = {
-        kAudioDevicePropertyDeviceUID,
+        sel,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
-    OSStatus status = AudioObjectGetPropertyData(deviceID, &addr, 0, NULL, &size, &uid);
+    OSStatus status = AudioObjectGetPropertyData(deviceID, &addr, 0, NULL, &size, &val);
     if (status != noErr) return NULL;
-    return uid;
-}
-
-// Get the name string for a given audio device
-static CFStringRef get_device_name(AudioObjectID deviceID) {
-    CFStringRef name = NULL;
-    UInt32 size = sizeof(name);
-    AudioObjectPropertyAddress addr = {
-        kAudioObjectPropertyName,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    OSStatus status = AudioObjectGetPropertyData(deviceID, &addr, 0, NULL, &size, &name);
-    if (status != noErr) return NULL;
-    return name;
+    return val;
 }
 
 // Check if a device name starts with "BlackHole_"
 static Boolean is_blackhole_device(AudioObjectID deviceID) {
-    CFStringRef name = get_device_name(deviceID);
+    CFStringRef name = get_device_string_prop(deviceID, kAudioObjectPropertyName);
     if (name == NULL) return false;
     Boolean result = CFStringHasPrefix(name, CFSTR("BlackHole_"));
     CFRelease(name);
@@ -56,20 +42,20 @@ static void remove_existing_aggregate(const char* uid) {
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
-
     UInt32 size = 0;
     OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size);
-    if (status != noErr) return;
+    if (status != noErr || size == 0) return;
 
     UInt32 deviceCount = size / sizeof(AudioObjectID);
     AudioObjectID* devices = malloc(size);
+    if (!devices) return;
     status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devices);
     if (status != noErr) { free(devices); return; }
 
     CFStringRef targetUID = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
 
     for (UInt32 i = 0; i < deviceCount; i++) {
-        CFStringRef deviceUID = get_device_uid(devices[i]);
+        CFStringRef deviceUID = get_device_string_prop(devices[i], kAudioDevicePropertyDeviceUID);
         if (deviceUID && CFStringCompare(deviceUID, targetUID, 0) == kCFCompareEqualTo) {
             printf("Removing existing aggregate device: %s\n", uid);
             AudioHardwareDestroyAggregateDevice(devices[i]);
@@ -102,13 +88,14 @@ int main(int argc, const char* argv[]) {
 
     UInt32 size = 0;
     OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size);
-    if (status != noErr) {
+    if (status != noErr || size == 0) {
         fprintf(stderr, "Error: Cannot get audio device list (status=%d)\n", status);
         return 1;
     }
 
     UInt32 deviceCount = size / sizeof(AudioObjectID);
     AudioObjectID* devices = malloc(size);
+    if (!devices) { fprintf(stderr, "Error: malloc failed\n"); return 1; }
     status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size, devices);
     if (status != noErr) {
         fprintf(stderr, "Error: Cannot enumerate audio devices (status=%d)\n", status);
@@ -116,24 +103,32 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    // Collect UIDs of all BlackHole_* devices
+    // Build sub-device list as an array of dictionaries
+    // kAudioAggregateDeviceSubDeviceListKey expects:
+    //   [ { kAudioSubDeviceUIDKey: "<uid>" }, ... ]
     CFMutableArrayRef subDeviceList = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     int found = 0;
 
     printf("Scanning for BlackHole_* devices...\n");
     for (UInt32 i = 0; i < deviceCount; i++) {
         if (is_blackhole_device(devices[i])) {
-            CFStringRef uid = get_device_uid(devices[i]);
-            CFStringRef name = get_device_name(devices[i]);
+            CFStringRef uid  = get_device_string_prop(devices[i], kAudioDevicePropertyDeviceUID);
+            CFStringRef name = get_device_string_prop(devices[i], kAudioObjectPropertyName);
             if (uid && name) {
                 char nameBuf[256], uidBuf[256];
                 CFStringGetCString(name, nameBuf, sizeof(nameBuf), kCFStringEncodingUTF8);
-                CFStringGetCString(uid, uidBuf, sizeof(uidBuf), kCFStringEncodingUTF8);
-                printf("  Found: %s (UID: %s)\n", nameBuf, uidBuf);
-                CFArrayAppendValue(subDeviceList, uid);
+                CFStringGetCString(uid,  uidBuf,  sizeof(uidBuf),  kCFStringEncodingUTF8);
+                printf("  Found: %s  (UID: %s)\n", nameBuf, uidBuf);
+
+                // Wrap UID in a dict: { kAudioSubDeviceUIDKey -> uid }
+                CFMutableDictionaryRef subDict = CFDictionaryCreateMutable(
+                    NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                CFDictionarySetValue(subDict, CFSTR(kAudioSubDeviceUIDKey), uid);
+                CFArrayAppendValue(subDeviceList, subDict);
+                CFRelease(subDict);
                 found++;
             }
-            if (uid) CFRelease(uid);
+            if (uid)  CFRelease(uid);
             if (name) CFRelease(name);
         }
     }
@@ -145,7 +140,7 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    printf("\nCreating aggregate device \"%s\" with %d sub-devices...\n", aggregateName, found);
+    printf("\nCreating aggregate device \"%s\" with %d sub-device(s)...\n", aggregateName, found);
 
     // Build the aggregate device description dictionary
     CFMutableDictionaryRef aggDesc = CFDictionaryCreateMutable(
@@ -155,10 +150,10 @@ int main(int argc, const char* argv[]) {
     CFStringRef cfUID  = CFStringCreateWithCString(NULL, aggregateUID,  kCFStringEncodingUTF8);
 
     CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceNameKey), cfName);
-    CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceUIDKey), cfUID);
+    CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceUIDKey),  cfUID);
     CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceSubDeviceListKey), subDeviceList);
 
-    // Make it public (visible in Audio MIDI Setup) and not stacked
+    // Public (visible in Audio MIDI Setup), not stacked
     int zero = 0;
     CFNumberRef cfZero = CFNumberCreate(NULL, kCFNumberIntType, &zero);
     CFDictionarySetValue(aggDesc, CFSTR(kAudioAggregateDeviceIsPrivateKey), cfZero);
