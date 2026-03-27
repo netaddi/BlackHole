@@ -1,0 +1,9 @@
+# BlackHole Multi-Cable Configuration
+# One cable suffix per line. Each suffix creates a separate 2ch virtual audio device.
+# Example: "netease_music" → device name "BlackHole_netease_music"
+
+netease_music
+chrome
+vlc
+other_browser
+video_player
