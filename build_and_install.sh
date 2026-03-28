@@ -132,8 +132,22 @@ if [ -f "$AGGREGATE_SRC" ]; then
         -framework CoreAudio -framework CoreFoundation \
         -arch x86_64 -arch arm64 2>/dev/null
 
-    "$AGGREGATE_BIN" "BlackHole_Aggregate" "audio.existential.BlackHole_Aggregate_UID"
+    aggregate_created=0
+    for attempt in {1..15}; do
+        if "$AGGREGATE_BIN" "BlackHole_Aggregate" "audio.existential.BlackHole_Aggregate_UID" "${#cables[@]}"; then
+            aggregate_created=1
+            break
+        fi
+
+        echo "Waiting for all ${#cables[@]} BlackHole devices to register with CoreAudio... (${attempt}/15)"
+        sleep 2
+    done
+
     rm -f "$AGGREGATE_BIN"
+    if [ "$aggregate_created" -ne 1 ]; then
+        echo "Error: failed to create aggregate after waiting for all BlackHole devices."
+        exit 1
+    fi
 else
     echo "Warning: create_aggregate_device.c not found, skipping aggregate device creation."
 fi

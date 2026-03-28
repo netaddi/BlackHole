@@ -12,7 +12,7 @@
  *   clang -o create_aggregate_device create_aggregate_device.c \
  *         -framework CoreAudio -framework CoreFoundation
  * Usage:
- *   ./create_aggregate_device [aggregate_name] [aggregate_uid]
+ *   ./create_aggregate_device [aggregate_name] [aggregate_uid] [expected_blackhole_count]
  */
 
 #include <CoreAudio/CoreAudio.h>
@@ -36,6 +36,24 @@ static CFStringRef get_string_prop(AudioObjectID obj, AudioObjectPropertySelecto
 static OSStatus set_float64_prop(AudioObjectID obj, AudioObjectPropertySelector sel, Float64 val) {
     AudioObjectPropertyAddress addr = { sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     return AudioObjectSetPropertyData(obj, &addr, 0, NULL, sizeof(val), &val);
+}
+
+static CFMutableDictionaryRef create_subdevice_dict(CFStringRef uid, Boolean enableDriftComp) {
+    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!dict) return NULL;
+
+    int drift = enableDriftComp ? 1 : 0;
+    int driftQuality = kAudioAggregateDriftCompensationHighQuality;
+    CFNumberRef driftValue = CFNumberCreate(NULL, kCFNumberIntType, &drift);
+    CFNumberRef driftQualityValue = CFNumberCreate(NULL, kCFNumberIntType, &driftQuality);
+
+    CFDictionarySetValue(dict, CFSTR(kAudioSubDeviceUIDKey), uid);
+    CFDictionarySetValue(dict, CFSTR(kAudioSubDeviceDriftCompensationKey), driftValue);
+    CFDictionarySetValue(dict, CFSTR(kAudioSubDeviceDriftCompensationQualityKey), driftQualityValue);
+
+    CFRelease(driftValue);
+    CFRelease(driftQualityValue);
+    return dict;
 }
 
 static Float64 get_float64_prop(AudioObjectID obj, AudioObjectPropertySelector sel) {
@@ -90,8 +108,10 @@ static void remove_existing_aggregate(const char* uid) {
 int main(int argc, const char* argv[]) {
     const char* aggregateName = "BlackHole_Aggregate";
     const char* aggregateUID  = "audio.existential.BlackHole_Aggregate_UID";
+    int expectedBHCount = 0;
     if (argc >= 2) aggregateName = argv[1];
     if (argc >= 3) aggregateUID  = argv[2];
+    if (argc >= 4) expectedBHCount = atoi(argv[3]);
 
     remove_existing_aggregate(aggregateUID);
 
@@ -112,13 +132,15 @@ int main(int argc, const char* argv[]) {
     }
     Float64 systemRate = get_float64_prop(defaultOut, kAudioDevicePropertyNominalSampleRate);
     if (systemRate == 0) systemRate = 48000.0;
+    UInt32 defaultOutIns = get_channel_count(defaultOut, kAudioDevicePropertyScopeInput);
+    UInt32 defaultOutOuts = get_channel_count(defaultOut, kAudioDevicePropertyScopeOutput);
 
     CFStringRef defaultOutUID  = get_string_prop(defaultOut, kAudioDevicePropertyDeviceUID);
     CFStringRef defaultOutName = get_string_prop(defaultOut, kAudioObjectPropertyName);
     char outNameBuf[256] = "unknown";
     if (defaultOutName) CFStringGetCString(defaultOutName, outNameBuf, sizeof(outNameBuf), kCFStringEncodingUTF8);
 
-    printf("System output device (clock master): %s @ %.0f Hz\n", outNameBuf, systemRate);
+    printf("System output device (clock master): %s @ %.0f Hz (in:%u out:%u)\n", outNameBuf, systemRate, defaultOutIns, defaultOutOuts);
 
     // Build sub-device list:
     //   1) Output device (clock master, provides output channels)
@@ -126,14 +148,26 @@ int main(int argc, const char* argv[]) {
     CFMutableArrayRef subList = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     int bhCount = 0;
 
-    // Add output device first (it becomes the clock master)
-    if (defaultOutUID) {
-        CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(d, CFSTR(kAudioSubDeviceUIDKey), defaultOutUID);
-        CFArrayAppendValue(subList, d);
-        CFRelease(d);
-        CFRelease(defaultOutUID);
+    if (!defaultOutUID) {
+        fprintf(stderr, "Error: Could not determine the system default output device UID.\n");
+        if (defaultOutName) CFRelease(defaultOutName);
+        free(devices);
+        CFRelease(subList);
+        return 1;
     }
+
+    // Add output device first and explicitly mark it as the aggregate time source.
+    CFMutableDictionaryRef outSubDevice = create_subdevice_dict(defaultOutUID, false);
+    if (!outSubDevice) {
+        fprintf(stderr, "Error: Could not allocate aggregate sub-device description.\n");
+        CFRelease(defaultOutUID);
+        if (defaultOutName) CFRelease(defaultOutName);
+        free(devices);
+        CFRelease(subList);
+        return 1;
+    }
+    CFArrayAppendValue(subList, outSubDevice);
+    CFRelease(outSubDevice);
     if (defaultOutName) CFRelease(defaultOutName);
 
     printf("Scanning for BlackHole_* devices...\n");
@@ -150,8 +184,21 @@ int main(int argc, const char* argv[]) {
             UInt32 outs = get_channel_count(devices[i], kAudioDevicePropertyScopeOutput);
             printf("  + %s  (in:%u out:%u  UID: %s)\n", nb, ins, outs, ub);
             if (uid) {
-                CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-                CFDictionarySetValue(d, CFSTR(kAudioSubDeviceUIDKey), uid);
+                OSStatus rateStatus = set_float64_prop(devices[i], kAudioDevicePropertyNominalSampleRate, systemRate);
+                if (rateStatus != noErr) {
+                    printf("    Warning: could not set %s to %.0f Hz (status=%d)\n", nb, systemRate, rateStatus);
+                }
+
+                CFMutableDictionaryRef d = create_subdevice_dict(uid, true);
+                if (!d) {
+                    fprintf(stderr, "    Error: could not allocate sub-device description for %s\n", nb);
+                    CFRelease(uid);
+                    CFRelease(name);
+                    free(devices);
+                    CFRelease(defaultOutUID);
+                    CFRelease(subList);
+                    return 1;
+                }
                 CFArrayAppendValue(subList, d);
                 CFRelease(d);
                 CFRelease(uid);
@@ -164,8 +211,15 @@ int main(int argc, const char* argv[]) {
 
     if (bhCount == 0) {
         fprintf(stderr, "Error: No BlackHole_* devices found.\n");
+        CFRelease(defaultOutUID);
         CFRelease(subList);
         return 1;
+    }
+    if (expectedBHCount > 0 && bhCount < expectedBHCount) {
+        fprintf(stderr, "Error: Found only %d/%d BlackHole devices; wait for CoreAudio registration and retry.\n", bhCount, expectedBHCount);
+        CFRelease(defaultOutUID);
+        CFRelease(subList);
+        return 2;
     }
 
     printf("\nCreating aggregate \"%s\" with %d sub-device(s) @ %.0f Hz...\n",
@@ -181,6 +235,7 @@ int main(int argc, const char* argv[]) {
     CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceNameKey), cfName);
     CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceUIDKey),  cfUID);
     CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceSubDeviceListKey), subList);
+    CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceMainSubDeviceKey), defaultOutUID);
     CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsPrivateKey), cfZero);  // visible
     CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsStackedKey), cfZero);  // parallel (not stacked)
 
@@ -188,6 +243,7 @@ int main(int argc, const char* argv[]) {
     OSStatus status = AudioHardwareCreateAggregateDevice(desc, &aggID);
 
     CFRelease(cfName); CFRelease(cfUID); CFRelease(cfZero);
+    CFRelease(defaultOutUID);
     CFRelease(subList); CFRelease(desc);
 
     if (status != noErr) {
@@ -208,7 +264,7 @@ int main(int argc, const char* argv[]) {
     printf("✅ \"%s\" created (ID:%u)  — %u ins / %u outs\n", aggregateName, aggID, aggIns, aggOuts);
     printf("\nIn Logic Pro:\n");
     printf("  → Set BOTH Input AND Output device to \"%s\"\n", aggregateName);
-    printf("  → Output goes to %s (channels 1-%u)\n", outNameBuf, aggOuts > 16 ? 16 : aggOuts);
-    printf("  → BlackHole inputs start at channel %u\n", aggOuts + 1);
+    printf("  → Output is clocked by %s\n", outNameBuf);
+    printf("  → Logic input channels available from this aggregate: %u\n", aggIns);
     return 0;
 }

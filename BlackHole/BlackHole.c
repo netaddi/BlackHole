@@ -4548,12 +4548,14 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
     static uint64_t lastWriteHostTime = 0;
     static Boolean isBufferClear = true;
     
-    // Threshold: consider output stale after ~1 second of no writes.
-    // mach_absolute_time() units depend on hardware; use mach_timebase_info to convert.
-    // As a practical shortcut, we compare raw ticks: on Apple Silicon ~1GHz timebase,
-    // 1 second ≈ 1,000,000,000 ticks. On Intel it varies but is similar order.
-    // Using 2,000,000,000 ticks (~1-2 seconds) as a conservative stale threshold.
-    static const uint64_t kStaleThresholdTicks = 2000000000ULL;
+    // Threshold: consider output stale after ~2 seconds of no writes.
+    // Derive host ticks from the device's calibrated host-ticks-per-frame value so
+    // the threshold stays correct across Apple Silicon and Intel timebases.
+    uint64_t staleThresholdTicks = 2000000000ULL;
+    if (gDevice_HostTicksPerFrame > 0.0 && gDevice_SampleRate > 0.0)
+    {
+        staleThresholdTicks = (uint64_t)(gDevice_HostTicksPerFrame * gDevice_SampleRate * 2.0);
+    }
     
     // From BlackHole to Application
     if(inOperationID == kAudioServerPlugInIOOperationReadInput)
@@ -4563,7 +4565,7 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         // so this works correctly when input and output run on different clock domains
         // (e.g., output via standalone device and input via aggregate device).
         uint64_t now = mach_absolute_time();
-        Boolean isStale = (lastWriteHostTime == 0) || (now - lastWriteHostTime > kStaleThresholdTicks);
+        Boolean isStale = (lastWriteHostTime == 0) || (now - lastWriteHostTime > staleThresholdTicks);
         if (gMute_Master_Value || isStale)
         {
             // Clear the ioMainBuffer
